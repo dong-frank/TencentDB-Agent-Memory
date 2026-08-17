@@ -9,7 +9,7 @@
  * 这里做归一化以兼容 INTERFACE 文档里写的 { baseUrl, maxTokens, timeoutMs } 别名。
  */
 
-import { generateText } from "ai";
+import { streamText } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createLogger } from "../../../logger.js";
@@ -127,7 +127,7 @@ export function createLlmClient(raw: RawLlmConfig | undefined): LlmClient {
       log.debug(`LLM user prompt [${label}] (model=${config.model})`, { text: params.prompt.slice(0, 500) });
 
       try {
-        const result = await generateText({
+        const stream = streamText({
           model: provider.chat(config.model),
           system: params.system,
           prompt: params.prompt,
@@ -139,18 +139,23 @@ export function createLlmClient(raw: RawLlmConfig | undefined): LlmClient {
             functionId: params.label ?? "chat",
           },
         });
-        const text = (result.text ?? "").trim();
-        const u = result.usage ?? ({} as Record<string, number>);
+        // streamText 无 result.text，需消费 textStream 聚合文本。
+        let text = "";
+        for await (const chunk of stream.textStream) {
+          text += chunk;
+        }
+        text = text.trim();
+        const u = (await stream.usage) ?? ({} as Record<string, number>);
         log.info(`LLM 调用完成 [${label}]`, {
           ms: Date.now() - startMs,
           promptTokens: u.inputTokens ?? null,
           completionTokens: u.outputTokens ?? null,
           totalTokens: u.totalTokens ?? null,
-          finishReason: result.finishReason ?? null,
+          finishReason: (await stream.finishReason) ?? null,
           outputChars: text.length,
         });
         if (!text) {
-          log.warn(`LLM 返回空文本 [${label}]`, { finishReason: result.finishReason ?? null });
+          log.warn(`LLM 返回空文本 [${label}]`, { finishReason: (await stream.finishReason) ?? null });
         }
         return text;
       } catch (err) {
