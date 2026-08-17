@@ -18,7 +18,7 @@
 
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import { streamText, tool, stepCountIs, jsonSchema } from "ai";
+import { generateText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
 import type {
@@ -318,11 +318,7 @@ export class StandaloneLLMRunner implements LLMRunner {
         ? AbortSignal.any([timeoutSignal, params.abortSignal])
         : timeoutSignal;
 
-      // NOTE: use streamText instead of generateText — the copilot.tencent.com/v2
-      // gateway rejects non-streaming chat/completions with code 11101 (Bad Request).
-      // streamText drives the multi-step tool loop via stopWhen/stepCountIs
-      // (AI SDK v6 removed `maxSteps`), so both pure-text and tool tasks work.
-      const result = streamText({
+      const result = await generateText({
         model: provider.chat(this.model),
         system: params.systemPrompt,
         prompt: params.prompt,
@@ -341,34 +337,26 @@ export class StandaloneLLMRunner implements LLMRunner {
         },
       });
 
-      // streamText has no `result.text` / `result.usage` synchronously — the
-      // text must be aggregated from `textStream`, and steps/usage are awaited.
-      let accText = "";
-      for await (const chunk of result.textStream) {
-        accText += chunk;
-      }
-      const text = accText.trim();
-      const steps = await result.steps;
-      const totalUsage = await result.totalUsage;
+      const text = (result.text ?? "").trim();
       const totalMs = Date.now() - runStartMs;
 
       // 暴露 token usage 到 side-channel（供 MetricTrackingRunner 读取）
-      if (totalUsage) {
+      if (result.usage) {
         this.lastUsage = {
-          promptTokens: totalUsage.inputTokens ?? 0,
-          completionTokens: totalUsage.outputTokens ?? 0,
-          totalTokens: (totalUsage.inputTokens ?? 0) + (totalUsage.outputTokens ?? 0),
+          promptTokens: result.usage.promptTokens ?? 0,
+          completionTokens: result.usage.completionTokens ?? 0,
+          totalTokens: (result.usage.promptTokens ?? 0) + (result.usage.completionTokens ?? 0),
         };
       } else {
         this.lastUsage = undefined;
       }
 
       this.logger?.debug?.(
-        `${TAG} run() completed (stream): ${totalMs}ms, steps=${steps.length}, output=${text.length} chars`,
+        `${TAG} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars`,
       );
 
       // Log each step's activity (tool calls + text output)
-      for (const step of steps) {
+      for (const step of result.steps) {
         const calls = step.toolCalls ?? [];
         const textLen = step.text?.length ?? 0;
         if (calls.length > 0) {
