@@ -1,0 +1,221 @@
+# ============================================================
+# TDAI Memory Core — Service 版配置模板 (对外分发版)
+# ============================================================
+# 适用场景: K8s 多副本 / 多租户 SaaS 部署
+# 特点: 完全无状态, Redis 分布式调度, 水平扩展
+# 依赖: Redis + Shark (实例配置中心) + TCVDB + COS
+#       (VDB/COS 凭证由 Shark 下发)
+#
+# ⚠ 填写指引:
+#   下面所有 REPLACE_ME_* 占位符都需要按你方基础设施改写:
+#     - Redis:            自建或云 Redis, 建议独立 db + 独立 keyPrefix
+#     - Shark:            实例配置中心 (可选私有部署或换实现)
+#     - LLM:              任一 OpenAI 兼容端点 + Key
+#     - MongoDB:          单实例或副本集, 建议 mongoTransactions=true 需副本集
+#     - 可观测三件套:      OTel / ClickHouse / Kafka / Langfuse, 不需要就 enabled: false
+# ============================================================
+
+deployMode: service
+
+server:
+  port: 8420
+  host: "0.0.0.0"
+  # ⚠ 不要配 server.apiKey / 不要设 TDAI_GATEWAY_API_KEY!
+  #   proxy 的 /v3/meta/auth/verify 请求源码里遗漏了 Bearer 头,
+  #   一旦 core 开启 gateway Bearer gate, proxy 走 auth 全部 401.
+  #   K8s 内网天然隔离, 关闭鉴权是官方推荐做法.
+
+data:
+  baseDir: data
+
+# ── LLM (OpenAI 兼容服务) ──
+llm:
+  baseUrl: "REPLACE_ME_LLM_BASE_URL"          # 例: https://api.your-llm-vendor.com/v1
+  apiKey: "REPLACE_ME_LLM_API_KEY"            # 你方 LLM 供应商的 API Key
+  model: "REPLACE_ME_LLM_MODEL"               # 例: gpt-4o-mini / minimax-m2.7 / 任一支持工具调用的模型
+  maxTokens: 8192
+  timeoutMs: 120000
+
+# ── Redis (分布式状态中枢) ──
+redis:
+  host: "REPLACE_ME_REDIS_HOST"
+  port: 6379
+  password: "REPLACE_ME_REDIS_PASSWORD"       # 无密码留空字符串
+  db: 0
+  keyPrefix: "tdai_memory_prod_v3"            # 建议按环境隔离前缀
+
+# ── Shark (实例配置中心, 下发 VDB/COS 凭证) ──
+# Shark 是运营方内部的配置分发服务, 对外分发时你方需要:
+#   a) 自建一个提供相同接口的服务 (contract 见 core 源码 shark-client.ts), 或
+#   b) 只用不依赖 Shark 的功能 (仅 memory recall, 不用 skill/knowledge)
+shark:
+  baseUrl: "REPLACE_ME_SHARK_BASE_URL"        # 例: http://shark.internal:18080
+  vdbTtlMs: 300000                            # VDB 配置缓存 5 分钟
+  cosBufferMs: 120000                         # COS 凭证提前 2 分钟刷新
+  maxInstances: 1000                          # 最大缓存实例数
+
+# ── Timer Scanner ──
+scanner:
+  instances: "default"
+  # 动态从 Shark 获取活跃实例列表 (推荐):
+  # instancesSharkUrl: "http://your-shark:8000/internal/instances/active"
+  intervalMs: 500
+
+# ── Pipeline Worker ──
+worker:
+  pollMs: 200
+
+# ── COS 额外配置 ──
+cos: {}
+  # 内网部署时指定 COS 内网域名 (加速访问, 免公网流量):
+  # domain: "https://<bucket>-<appid>.cos-internal.<region>.tencentcos.cn"
+
+# ── Memory 引擎配置 ──
+memory:
+  # code 模式：L1/L2/L3 使用面向代码协作场景的提示词族。
+  promptMode: code
+
+  capture:
+    enabled: true
+
+  extraction:
+    enabled: true
+    enableDedup: true
+    maxMemoriesPerSession: 20
+
+  persona:
+    triggerEveryN: 50
+    maxScenes: 15
+
+  pipeline:
+    everyNConversations: 5
+    enableWarmup: true
+    l1IdleTimeoutSeconds: 600
+    l2DelayAfterL1Seconds: 90
+    l2MinIntervalSeconds: 900
+    l2MaxIntervalSeconds: 3600
+
+  recall:
+    enabled: true
+    maxResults: 5
+    scoreThreshold: 0.3
+    strategy: "hybrid"
+    timeoutMs: 5000
+
+  # service 模式下 VDB 由 Shark 管理, 不需要本地 storeBackend/tcvdb 配置
+  # storeBackend 会自动使用 tcvdb
+
+  embedding:
+    provider: "none"                          # service 模式下 VDB 内置 embedding
+    # 如需自定义 embedding:
+    # provider: "openai"
+    # baseUrl: "https://api.openai.com/v1"
+    # apiKey: "${TDAI_LLM_API_KEY}"
+    # model: "text-embedding-3-small"
+    # dimensions: 1536
+
+  bm25:
+    enabled: true
+    language: "zh"
+
+skill:
+  # 总开关。false/缺失 → /v3/skill/* 返回 404，Memory 不受影响。
+  # 也可用环境变量 TDAI_SKILL_ENABLED=true 强制开启。
+  enabled: true
+
+  # 【service 不填】storeBackend / contentBackend：
+  #   由 gateway 按 instanceId 装配 TcvdbSkillStore + COS（Shark 下发凭证）。
+  #   显式写死反而无意义——service 装配链不读 skill.storeBackend/contentBackend。
+
+  routing:
+    # embedding / hybrid 需 memory.embedding 可用；此处 provider=none，
+    # 写 hybrid/embedding 会自动降级 bm25（warn），故直接写 bm25。
+    mode: "bm25"
+    searchTopK: 20                            # listing 接口最多注入多少条 skill (name+description)
+
+  extraction:
+    enabled: true                             # 复用顶层 llm (baseUrl + apiKey)
+    maxIterations: 16                         # Review Agent tool-calling 最大迭代轮数
+
+    # ── 归档尺寸单旋钮 ──
+    # archiveBytes 同时决定 4 个语义, 改一个值全部随动:
+    #   • buffer 累计 ≥ archiveBytes → 触发归档
+    #   • 单次 add 请求 ≥ archiveBytes → 强制走压缩路径
+    #   • 归档 payload > 2 × archiveBytes → 兜底切分, 头 archiveBytes + 尾 archiveBytes
+    #   • Skill review transcript > 2 × archiveBytes → 截成头 + 尾
+    # 默认: 40960 (40KB)
+    archiveBytes: 102400                      # 100KB (上下文窗口 ~200KB / 200k chars)
+
+    # ── 抽取队列 ──
+    # 注意：service 模式 /v3/skill/extract 走「同步抽取」路径, 不消费该队列;
+    #       以下配置仅在回退到异步队列路径时生效.
+    #       backend=redis 时复用顶层 redis 共享客户端, redisUrl 留空即可.
+    queue:
+      backend: "redis"
+      keyPrefix: "tdai_memory_prod"           # 建议跟顶层 redis.keyPrefix 保持一致的环境标识
+      resultTtlSeconds: 86400
+      lockTtlMs: 600000
+      maxRetries: 2
+      retryBackoffsMs: [5000, 15000]
+
+  # ── 单条大 tool 消息头尾压缩 ──
+  # 只影响 tool_call / tool_result 单条 content 超阈值时的头尾切分；
+  # user/assistant/system 永不压缩。以下均为默认值，无需修改可直接省略整段。
+  compress:
+    toolContentThresholdBytes: 2048           # 超过多少字节才压缩. 默认: 2048 (2KB)
+    headBytes: 1024                           # 保留头字节. 默认: 1024 (1KB)
+    tailBytes: 1024                           # 保留尾字节. 默认: 1024 (1KB)
+
+  resources:
+    maxResourceSizeBytes: 5000000             # 单个资源文件上限 (5MB), 超限拒写
+
+# ── 可观测性 (全部可选, 不需要就把对应 enabled 改 false) ──
+observability:
+  otel:
+    enabled: false                            # OpenTelemetry Trace 上报, 需要就打开
+    endpoint: "REPLACE_ME_OTEL_ENDPOINT"      # 例: http://otel-collector:4317
+    protocol: "grpc"
+    serviceName: "core"
+    serviceVersion: "1.0.0"
+    tenantId: "REPLACE_ME_OTEL_TENANT_ID"    # 云厂商 APM 的租户 ID, 自建可留空
+    logExportInterval: 5
+
+  clickhouse:
+    enabled: false                            # 用量/评测日志入 ClickHouse
+    endpoint: "REPLACE_ME_CLICKHOUSE_ENDPOINT"  # 例: http://clickhouse:8123
+    username: "default"
+    password: "REPLACE_ME_CLICKHOUSE_PASSWORD"
+    database: "tdai_eval"
+
+  kafka:
+    enabled: false                            # 事件 / 监控 topic 上报
+    brokers: "REPLACE_ME_KAFKA_BROKERS"       # 例: kafka-0:9092,kafka-1:9092
+    topic: "memory_monitor"
+    totalPartitions: 32
+
+  langfuse:
+    enabled: false                            # LLM 调用可观测
+    host: "REPLACE_ME_LANGFUSE_HOST"          # 例: http://langfuse:8080
+    publicKey: "REPLACE_ME_LANGFUSE_PUBLIC_KEY"
+    secretKey: "REPLACE_ME_LANGFUSE_SECRET_KEY"
+
+metadata:
+  # ── 实例配额 (可被环境变量覆盖: TDAI_METADATA_MAX_USERS / TDAI_METADATA_MAX_TEAMS) ──
+  maxUsersPerInstance: 500
+  maxTeamsPerInstance: 100
+
+  # ── v3 元数据存储 (有 mongoUri → MongoDB; 懒建库 tdai_metadata_{service-id}) ──
+  store:
+    # ⚠ mongoTransactions=true 要求副本集; 单机 Mongo 请置为 false 或部署副本集
+    mongoUri: "REPLACE_ME_MONGO_URI"          # 例: mongodb://user:pass@host:27017/?authSource=admin
+    mongoDbPrefix: "tdai_metadata"            # 库名前缀, 建议按环境后缀 (_prod / _dev)
+    mongoTransactions: true
+    storeCacheMaxInstances: 128
+
+  # ── memory 内部系统用户 (不落库; Header 鉴权不可使用此 key) ──
+  # 用于 memory service 自我调用, 值随便填一个高熵字符串即可, 不用泄露给用户.
+  systemUser:
+    memory:
+      userId: usr-sys-memory
+      displayName: memory
+      userKey: "REPLACE_ME_SYSTEM_MEMORY_USER_KEY"   # 例: openssl rand -base64 32

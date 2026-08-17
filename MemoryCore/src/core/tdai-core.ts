@@ -137,6 +137,12 @@ export interface TdaiCoreOptions {
    * （零耦合：OpenClaw 无 MetadataService 场景仍可安全构造）。
    */
   skillAssetHooks?: SkillAssetHooks;
+  /**
+   * 可选：按真实 userId 解析该用户自己配置的上游 llm.api_key。
+   * 注入后，抽取链路（L1/L2/L3/skill）携带真实 userId 时，会用该用户自己的 key
+   * 覆盖系统级 key（baseUrl/model 仍走系统配置）。返回 undefined 回落系统 key。
+   */
+  resolveUserApiKey?: (userId?: string) => Promise<string | undefined>;
 }
 
 // ============================
@@ -190,6 +196,12 @@ export class TdaiCore {
    */
   private skillAssetHooks?: SkillAssetHooks;
   /**
+   * 可选：按真实 userId 解析该用户自己配置的上游 llm.api_key。
+   * 由 gateway 装配层注入（用 ConfigParamService.getEffectiveParam("llm","api_key",userId) 实现），
+   * 供 StandaloneLLMRunner 在抽取带 userId 时动态换 key（baseUrl/model 仍走系统配置）。
+   */
+  private resolveUserApiKey?: (userId?: string) => Promise<string | undefined>;
+  /**
    * B1 fix: in-flight guard for `ensureSkillModuleWired()`. The original guard
    * was a sync `if (this.skillCore) return`, but assignment to `skillCore`
    * happens AFTER `await storeReady` + SkillCore/queue construction. Two
@@ -231,6 +243,7 @@ export class TdaiCore {
     this.instanceId = opts.instanceId;
     this.storage = opts.storage;
     this.skillAssetHooks = opts.skillAssetHooks;
+    this.resolveUserApiKey = opts.resolveUserApiKey;
   }
 
   // ============================
@@ -663,7 +676,12 @@ export class TdaiCore {
   private shouldOverrideRunnerFactory(useStandaloneRunner: boolean): boolean {
     if (!useStandaloneRunner || !this.cfg.llm.enabled) return false;
     if (this.hostAdapter.hostType === "openclaw") return true;
-    return this.cfg.llm.provider === "proxy";
+    if (this.cfg.llm.provider === "proxy") return true;
+    // per-user key 只有 standalone runner 能吃到：当注入 resolveUserApiKey 时
+    // 必须 override 成 StandaloneLLMRunnerFactory（baseUrl/model 仍走系统配置，
+    // 仅把 key 换成用户自己配的），否则 L1/L2/L3/skill 仍走 host 默认 factory，
+    // 用户 key 完全不会被使用。
+    return !!this.resolveUserApiKey;
   }
 
   private wirePipelineRunners(): void {
@@ -695,7 +713,10 @@ export class TdaiCore {
       try {
         const runtimeLlm = this.resolveRuntimeLlm();
         runnerFactory = new StandaloneLLMRunnerFactory({
-          config: runtimeLlm,
+          config: {
+            ...runtimeLlm,
+            ...(this.resolveUserApiKey ? { resolveUserApiKey: this.resolveUserApiKey } : {}),
+          },
           logger: this.logger,
         });
         this.logger.debug?.(
@@ -1006,6 +1027,7 @@ export class TdaiCore {
         model: runtimeLlm.model,
         maxTokens: runtimeLlm.maxTokens,
         timeoutMs: runtimeLlm.timeoutMs,
+        ...(this.resolveUserApiKey ? { resolveUserApiKey: this.resolveUserApiKey } : {}),
       },
       // Default to enabled so the runner doesn't strip caller-provided tools.
       enableTools: true,
@@ -1058,7 +1080,10 @@ export class TdaiCore {
     if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
       const runtimeLlm = this.resolveRuntimeLlm();
       runnerFactory = new StandaloneLLMRunnerFactory({
-        config: runtimeLlm,
+        config: {
+          ...runtimeLlm,
+          ...(this.resolveUserApiKey ? { resolveUserApiKey: this.resolveUserApiKey } : {}),
+        },
         logger: this.logger,
       });
       this.logger.debug?.(
@@ -1108,7 +1133,10 @@ export class TdaiCore {
     if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
       const runtimeLlm = this.resolveRuntimeLlm();
       runnerFactory = new StandaloneLLMRunnerFactory({
-        config: runtimeLlm,
+        config: {
+          ...runtimeLlm,
+          ...(this.resolveUserApiKey ? { resolveUserApiKey: this.resolveUserApiKey } : {}),
+        },
         logger: this.logger,
       });
       this.logger.debug?.(
@@ -1152,7 +1180,10 @@ export class TdaiCore {
     if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
       const runtimeLlm = this.resolveRuntimeLlm();
       runnerFactory = new StandaloneLLMRunnerFactory({
-        config: runtimeLlm,
+        config: {
+          ...runtimeLlm,
+          ...(this.resolveUserApiKey ? { resolveUserApiKey: this.resolveUserApiKey } : {}),
+        },
         logger: this.logger,
       });
       this.logger.debug?.(

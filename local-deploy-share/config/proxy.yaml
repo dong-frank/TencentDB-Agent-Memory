@@ -1,0 +1,316 @@
+# ============================================================
+# TDAI Memory Proxy — Service 版配置模板 (对外分发版)
+# ============================================================
+# 依赖:
+#   - Core (memory-core) 提供 auth/verify + tdai + skill + knowledge 端点
+#   - Shark (COS 凭证下发, 与 core 共用)
+#   - Redis (CostGuard 会话 / 注入缓存)
+#   - Upstream LLM (Anthropic / OpenAI 兼容端点)
+#
+# ⚠ 填写指引:
+#   REPLACE_ME_* 都需按你方基础设施改写。
+#   典型 5 项:  upstream / redis / storage.cos.shark / auth+tdai+skill+knowledge / cost-guard.analyze
+# ============================================================
+
+server:
+  host: 0.0.0.0
+  port: 8096
+  forwardTimeoutMs: 600000                    # 上游请求超时 (毫秒), 0 = 不超时; 默认 10 分钟
+
+# ── 上游 LLM ──
+# 三档 apiKey 语义 (详见 tdai-memory-openclaw-plugin/MemoryProxy/config.example.yaml):
+#   ① 外层 apiKey + agent 不在下面表里 → 用外层 key
+#   ② agent 在表里 + agents.<x>.apiKey 有值 → 用 per-agent key
+#   ③ agent 在表里 + agents.<x>.apiKey 缺失 → 透传客户端 key
+upstream:
+  url: "REPLACE_ME_UPSTREAM_URL"              # 默认上游, 例: https://api.anthropic.com
+  agents:
+    codebuddy:
+      url: "REPLACE_ME_CODEBUDDY_UPSTREAM_URL"
+    claude-code:
+      # Anthropic 兼容层入口是 POST /v1/messages;
+      # proxy joinUrl 会拼上 /messages, 所以 base 必须自带 /v1 尾巴, 否则 404.
+      url: "REPLACE_ME_CLAUDE_CODE_UPSTREAM_URL"    # 例: https://api.anthropic.com/v1
+    codex:
+      # Codex 走 OpenAI Responses API (POST /v1/responses);
+      # 不是所有兼容层都支持, 请自行验证.
+      url: "REPLACE_ME_CODEX_UPSTREAM_URL"          # 例: https://api.openai.com/v1
+      # apiKey 用运营方统一 key; 客户端只用 team-proxy 分发的 user_key 走鉴权,
+      # proxy 转发时用这个上游 key, 客户端 key 会被覆盖.
+      apiKey: "REPLACE_ME_CODEX_UPSTREAM_API_KEY"
+
+log:
+  file: logs                                  # 日志目录, 按日期自动生成
+  verbose: false
+  level: info                                 # info | debug
+  backend: console                            # noop | console
+  rotate:
+    maxSizeBytes: 104857600                   # 单文件最大 100MB 后轮转
+    backupLimit: 10
+
+opik:
+  enabled: false                              # Opik trace 上报, 不用就 false
+  url: "REPLACE_ME_OPIK_URL"                  # 例: http://opik:8081
+  apiKey: ""
+
+# ── Langfuse LLM 可观测 (官方 SDK 上报, 一个 trace = 一个 turn) ──
+langfuse:
+  enabled: false
+  host: "REPLACE_ME_LANGFUSE_HOST"
+  publicKey: "REPLACE_ME_LANGFUSE_PUBLIC_KEY"
+  secretKey: "REPLACE_ME_LANGFUSE_SECRET_KEY"
+  # Debug 模式: generation input 保留原生 Anthropic body 结构, 用于排查 cache 命中率;
+  # 线上默认关闭 (体积增大 2-5x), 本地排障时打开.
+  debug: false
+
+costGuard:
+  enabled: true                               # 成本守卫: LLM 分析任务复杂度后智能路由
+
+  # URL Marker 门控 —— 只有请求路径带 `/cost-guard` 段才启用 router,
+  # 裸路径 passthrough 直连上游. 用于 A/B 对比. 默认关闭 = 恢复 "router-always-on" 历史行为.
+  markerOptIn: false
+
+  # 分析模型 (轻量、快速, 用于判断任务复杂度)
+  analyzeModel: "REPLACE_ME_ANALYZE_MODEL"    # 例: deepseek-v4-flash
+  analyzeUrl: "REPLACE_ME_ANALYZE_URL"        # 例: https://api.your-llm-vendor.com/v1/chat/completions
+  analyzeApiKey: "REPLACE_ME_ANALYZE_API_KEY"
+  analyzeProtocol: "openai"                   # openai | anthropic
+  analyzeTimeout: 30000
+
+  agents:                                     # per-agent override
+    claude-code:
+      cheapModel: "REPLACE_ME_CHEAP_MODEL"
+      cheapUrl: "REPLACE_ME_CHEAP_URL"        # 例: https://api.your-llm-vendor.com/v1
+      cheapApiKey: "REPLACE_ME_CHEAP_API_KEY"
+    codebuddy:
+      cheapModel: "REPLACE_ME_CHEAP_MODEL"
+
+  # 工具循环降级策略
+  toolLoopDegradeStrategy: "roundRobin"       # stochastic (随机) | roundRobin (固定轮转)
+  toolLoopDegradePercent: 50                  # stochastic 模式: 降级到便宜模型的概率
+  toolLoopRoundRobin:                         # roundRobin 模式: 轮转配置
+    targetCount: 2                            #   走 target 的次数
+    cheapCount: 2                             #   走 cheap 的次数
+  maxConsecutiveDegrade: 3                    # 连续降级最大次数, 超过后强制回到 target
+
+  # Agent profile: 识别请求来自哪个 coding agent
+  #   auto (默认) = 按请求头自动检测
+  #   也可强制指定: codebuddy | claude-code
+  agentProfile: "auto"
+
+redis:
+  enabled: true                               # 启用 Redis 存储 CostGuard 会话 (多实例共享状态必需)
+  url: ""                                     # Redis URL (redis://:password@host:port/db), 设置后覆盖下方 host/port/password/db
+  host: "REPLACE_ME_REDIS_HOST"
+  port: 6379
+  password: "REPLACE_ME_REDIS_PASSWORD"
+  db: 0
+  keyPrefix: "cg:sess:prod:"                  # 建议按环境后缀, 避免撞库
+  ttlSeconds: 2592000                         # 会话 TTL (秒), 默认 30 天
+
+# ── Storage (注入 + Skill 层的统一存储, 替代 Redis 承载 inj:*/sk:*/vpin:*) ──
+# CostGuard 会话仍走 redis:; 这里只覆盖注入层与 Skill 层的持久化后端.
+storage:
+  enabled: true
+  backend: cos                                # cos | sqlite | fs | memory; 生产多实例用 cos
+  ttlDays: 7                                  # 仅 sqlite sweeper 读; cos 走桶 lifecycle rule
+
+  cos:
+    rootPrefix: "proxy_cache/"                # 业务命名空间前缀
+    # 桶只允许内网访问 → 必须显式指定内网域名, 否则 SDK 走公网被拒
+    endpointDomain: "REPLACE_ME_COS_INTERNAL_DOMAIN"    # 例: cos-internal.ap-guangzhou.tencentcos.cn
+    # ── 从 Shark 拉临时凭证 (proxy 只支持这个模式, 禁止静态 AK/SK) ──
+    # bucket / region 由 Shark 返回的 CosUrl 解析, 不用配.
+    shark:
+      baseUrl: "REPLACE_ME_SHARK_BASE_URL"    # 建议跟 core.yaml 的 shark.baseUrl 保持一致
+      timeoutMs: 10000
+      retryCount: 2
+      refreshBufferMs: 120000                 # STS 到期前 2min 刷新
+      maxSpaces: 100                          # per-spaceId backend 池上限 (LRU)
+      graceCloseDelayMs: 30000                # LRU evict 时延迟关闭 (in-flight 保护)
+
+  sqlite:
+    dbPath: ""                                # 空 = ~/.tdai-memory-proxy/proxy.db (未用到)
+  fs:
+    fsRoot: "/var/lib/context-proxy/storage"  # 未用到
+
+# ── ClickHouse 用量上报 ──
+# 用于按 turn 展示每个用户的 token 消耗; 表结构见 proxy 源码.
+clickhouse:
+  enabled: false                              # 不需要就 false
+  url: "REPLACE_ME_CLICKHOUSE_URL"            # 例: http://clickhouse:8123
+  database: context_proxy
+  table: usage_logs
+  rawTable: usage_raw
+  user: default
+  password: "REPLACE_ME_CLICKHOUSE_PASSWORD"
+  flushIntervalMs: 5000
+  flushThreshold: 50
+  ttlDays: 30
+
+# ── Credit 上报 ──
+# 路由 /proxy/<spaceId>/v1/messages 的请求在 LLM 应答完成后, 会向此 URL POST 计费.
+# 不需要计费上报就把 url 留空.
+creditReport:
+  url: "REPLACE_ME_CREDIT_REPORT_URL"         # 例: http://your-billing-service/UpdateMemoryPlusUsage
+  timeoutMs: 5000
+
+# ── Credit 计费价目表 ──
+# 单位: Credit / 1K Token
+# 字段说明:
+#   input         — 标准输入 token (非缓存部分)
+#   output        — 输出 token
+#   cacheRead     — 缓存命中 token
+#   cacheWrite5m  — 缓存写入 5m TTL
+#   cacheWrite1h  — 缓存写入 1h TTL
+# 模型匹配规则: usage.model → 精确匹配 → 大小写不敏感子串匹配 → 未匹配则降级为原始 token 数
+#
+# 此模板默认为空 (透传模型 id), 需要计费上报的团队请按自己的商务定价填写:
+# creditPricing:
+#   models:
+#     - name: "your-model-id"
+#       modelName: "Display Name"
+#       input: 0.4500
+#       output: 0.9000
+#       cacheRead: 0.0038
+#       cacheWrite5m: 0.4500
+#       cacheWrite1h: 0.4500
+
+# ── Auth 鉴权服务 (user_key 校验 + user_id 解析) ──
+# 通过调用 core POST /v3/meta/auth/verify 校验客户端 API Key (user_key).
+# 启用后, 任何非 valid=true 的结果都会返回 401 (含超时/网络错误).
+auth:
+  enabled: true
+  url: "REPLACE_ME_CORE_BASE_URL"             # core 的 base URL, 例: http://memory-core:8420
+  timeoutMs: 5000
+
+# ── System users (内部服务账号: 命中即全链路透传) ──
+# 命中流程: apiKey → auth/verify 拿 user_id → user_id 在下方 systemUsers 列表里 → 短路透传.
+# 命中后 proxy 只做一件事: 原样转发到 upstream.url, 跳过 sessionInit/injection/cost-guard/body 改写.
+# 仍会记 usage/credit (keyId = userId, spaceId = 路径中的 memory 实例 id).
+# 依赖 auth.enabled=true.
+# userKey 字段仅运维参考 (曾经是匹配键, 现在只在日志/注释里出现), 可以不配; userId 必填.
+systemUsers:
+  - name: memory
+    userId: usr-sys-memory
+    displayName: memory
+    # userKey: "..."       # 可选, 建议留空; 值取自 core.yaml 的 metadata.systemUser.memory.userKey
+  - name: knowledge
+    userId: knowledge-service
+    displayName: "Knowledge Service"
+
+# ── 会话初始化 (session init) ──
+# 用户首次对话时拦截请求, 弹出交互式表单引导选择 team → agent → task.
+# 选择完成后从内核拉 agent/task 详情, 注入 <session_context> 到 system prompt.
+# 状态存 Redis (依赖 redis.enabled=true), 支持多实例共享.
+# 流程: asset_confirm → team_select(多team时) → agent_select(支持分页) → task_select(可选/可跳过) → 注册注入
+#
+# 用户身份由 auth/verify 一跳确定; 无法识别身份 / agent 没有 team 归属 → 直接 bypass.
+# 表单解析 (点选项 + 结构化 regex) 失败达 maxRetries 后 bypass; LLM 兜底解析已下线.
+sessionInit:
+  enabled: true
+  maxRetries: 3
+  keepInitArtifacts: false                    # false = 完成后删除假表单对话 (推荐)
+  defaultTaskId: "default"                    # task_select 跳过时的默认 task_id
+  # <session_context> 注入开关
+  injectAgentContext: true                    # false = 不注入 [Agent] 段
+  injectTaskContext: true                     # false = 不注入 [Task] 段
+  # header 自动预选
+  headerAutoSelect:
+    enabled: true
+    teamHeader: "x-team-id"
+    agentHeader: "x-agent-id"
+    taskHeader: "x-task-id"
+    onMismatch: "form"                        # form=回退表单 (默认) | bypass=跳过 session init
+
+# ── 上下文注入 (injection pipeline) ──
+# 在每次 LLM 请求的 system prompt 中注入相关知识/记忆/技能.
+# injector 说明:
+#   skill       — <cloud_skills> RAG + <skill_tools> (curl 调用方法); 数据源 = skill 段的 endpoint
+#   wiki        — 通过外部服务 POST {injection.endpoint}/search 检索知识库; 留空 endpoint = demo 假数据
+#   knowledge   — <knowledge_tools>: 从内核拉 team 知识资源列表
+#   tdai-memory — TDAI L2/L3 记忆注入 (由 tdai.memory.* 控制)
+injection:
+  enabled: true
+  endpoint: ""                                # 仅 wiki injector 消费, 留空 = 内置 demo 假数据
+  injectors: ["skill", "wiki", "knowledge", "tdai-memory"]
+  externalGatewayUrl: "REPLACE_ME_EXTERNAL_GATEWAY_URL"   # 外部 memory-hub / gateway 入口, 例: http://memory-hub:8080
+  # 内部效果评估: URL 带 /analyse marker 时在 system prompt 末尾追加 <asset_reflection>
+  assetReflection:
+    markerOptIn: true
+
+# ── TDAI Memory (L0~L3 四级记忆读写) ──
+# 内核鉴权说明 (tdai / skill / auth 三者访问同一个 gateway):
+#   - endpoint:  网关地址
+#   - apiKey:    proxy → 内核 的 Authorization: Bearer <apiKey>
+#                内核 server.apiKey 不配 → 鉴权开放 (传啥都行), 配了 → 必须一致
+#   - serviceId: proxy → 内核 的 x-tdai-service-id header (必填, 缺了 401);
+#                service 模式下作为 instance_id 做 DB 租户路由.
+tdai:
+  enabled: true
+  endpoint: "REPLACE_ME_CORE_BASE_URL"        # 与 auth.url 一般相同
+  apiKey: "local"                             # 内核未开鉴权时随便填; 开了就跟 core.server.apiKey 一致
+  serviceId: "default"                        # x-tdai-service-id (必填, service 模式下 = 实际 instance_id)
+  memory:
+    enabled: true
+    inject: true                              # 记忆注入总开关
+    writeL0: true                             # 每次对话后写入 L0
+    recallL1: true                            # 按 query 召回 L1
+    injectL2L3: true                          # L2/L3 注入 system prompt
+    l1Limit: 5
+    l2Limit: 3
+    timeoutMs: 5000
+
+# ── Skill / 内核 gateway 数据面 ──
+# 复用内核 gateway, 三项职责:
+#   1. <cloud_skills> RAG 注入 — GET /v3/skill/search
+#   2. Skill 提取触发 — fire-and-forget POST /v3/skill/extract?mode=async
+#   3. sessionInit MetadataClient — 拉取 team/agent/task 列表
+# serviceToken 与 tdai.apiKey 语义相同 (Bearer token), 保持一致.
+# serviceToken 同时被 /skill-bridge 反代在 curl 请求头中自动注入, 不会出现在 prompt 中.
+skill:
+  endpoint: "REPLACE_ME_CORE_BASE_URL"        # 与 tdai.endpoint 一般相同
+  serviceToken: "local"                       # 与 tdai.apiKey 一般相同
+  serviceId: "context-proxy"                  # x-tdai-service-id (必填, 标识调用方是 proxy)
+  timeoutMs: 6000
+
+rateLimit:
+  tpm: 0                                      # 0 = 关闭 TPM 限流
+  qpm: 0                                      # 0 = 关闭 QPM 限流
+
+# ── Skill 运行时 (提取触发阈值) ──
+skillRuntime:
+  extractToolCallThreshold: 10                # 单 session 桶累计 tool call 达到此数 → 触发 extract
+  allowLlmWrite: false                        # false: <skill_tools> 只注入只读工具, /skill-bridge 拒写返回 403
+                                              # true : 注入全部工具 (含 create/update/delete)
+  maxBucketCount: 500                         # extract 对话缓存最大 session 数, 超出 LRU 淘汰
+
+# ── Knowledge tools 注入 (独立 gateway 配置) ──
+# proxy 通过此配置访问内核 gateway 拉取 team 知识资源 (code-graph / wiki),
+# 渲染 <knowledge_tools> 块注入 system prompt.
+# 与 skill 段独立: endpoint 可以不同 (例如 skill 走内核直连 IP, knowledge 走 API Gateway 域名).
+knowledge:
+  enabled: true
+  endpoint: "REPLACE_ME_CORE_BASE_URL"
+  serviceToken: "local"
+  serviceId: "context-proxy"                  # 会被请求路径 spaceId 覆盖
+  timeoutMs: 1500
+
+# ── mem: 特殊命令 ──
+# 用户在对话框输入 mem:sync / mem:create-skill / mem:help 等命令时,
+# Proxy 拦截并直接返回伪造 LLM 响应, 不注入系统提示词, 不转发给上游模型.
+memCommand:
+  enabled: true
+  allowedCommands: ["sync", "create-skill", "help"]
+
+# ── CC 请求分流 ──
+# 启用后按 cache_control marker 位置 + tools/thinking 兜底把 CC 客户端请求分类:
+#   - main: 用户主对话 / tool-loop 续写 → 走全套 (session-init + injection + L0 + skill)
+#   - fork: SUGGESTION / RECAP / COMPACT 等复用 MAIN cache 的辅助请求
+#          → 跳过 session-init form / mem 拦截 / L0 / skill; injection 走 readOnly 模式
+#   - sidequery: TITLE / verify_api_key 等独立小请求
+#          → 跳过 session-init / mem 拦截 / injection / L0 / skill
+# Credit 三类都上报 (token 消耗真实).
+# 关闭时所有请求视为 main, 走完全等价的老链路.
+ccRequestRouting:
+  enabled: true

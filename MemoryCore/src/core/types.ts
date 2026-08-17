@@ -129,6 +129,12 @@ export interface LLMRunParams {
    * Langfuse 顶级 userId 字段。空字符串等价于未传。
    */
   userId?: string;
+  /**
+   * Per-call apiKey override。显式传入时优先于系统 key 与 per-user 解析；
+   * 通常无需调用方传——StandaloneLLMRunner 会根据 userId 用
+   * config.resolveUserApiKey 自动解析该用户自己的 `llm.api_key`。
+   */
+  apiKey?: string;
 }
 
 /**

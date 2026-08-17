@@ -100,6 +100,13 @@ export interface StandaloneLLMConfig {
     /** 是否用 memory systemUser.userKey 作为 Authorization（默认 true）。 */
     useMemorySystemUserKey?: boolean;
   };
+  /**
+   * 可选：按真实 userId 动态解析该用户自己配置的上游 api key。
+   * 抽取链路（L1/L2/L3/skill）会带上用户的真实 userId；当该用户在页面
+   * 配置了自身的 `llm.api_key` 时，用它覆盖系统级 key（baseUrl/model 仍走系统配置）。
+   * 返回 undefined 时回落系统 key。当前部署 provider=openai 直连上游，无需经 proxy。
+   */
+  resolveUserApiKey?: (userId?: string) => Promise<string | undefined>;
 }
 
 // ============================
@@ -267,6 +274,27 @@ export class StandaloneLLMRunner implements LLMRunner {
     const timeoutMs = params.timeoutMs ?? this.config.timeoutMs ?? 120_000;
     const maxTokens = params.maxTokens ?? this.config.maxTokens ?? 4096;
     const workspaceDir = params.workspaceDir ?? process.cwd();
+    // Per-call apiKey override: explicit `params.apiKey` wins; otherwise, if a
+    // per-user key resolver is configured AND the caller passed the real
+    // userId, resolve that user's own `llm.api_key` and use it when present.
+    // baseUrl/model stay system-configured — this only swaps the credential.
+    let effectiveApiKey = params.apiKey;
+    if (!effectiveApiKey && this.config.resolveUserApiKey && params.userId) {
+      try {
+        const userKey = await this.config.resolveUserApiKey(params.userId);
+        if (typeof userKey === "string" && userKey.length > 0) {
+          effectiveApiKey = userKey;
+          this.logger?.debug?.(`${TAG} Using per-user apiKey for userId=${params.userId}`);
+        }
+      } catch (err) {
+        // fail-open: never let a key-resolution failure break extraction
+        this.logger?.debug?.(
+          `${TAG} resolveUserApiKey(${params.userId}) failed, falling back to system key: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    effectiveApiKey = effectiveApiKey ?? this.config.apiKey;
     // Per-call overrides — when the caller supplies their own tools (e.g.
     // SkillExtractor's skill_list/skill_view/skill_manage), they trump the
     // runner-level enableTools default. This lets one runner instance
@@ -285,7 +313,7 @@ export class StandaloneLLMRunner implements LLMRunner {
     // which works with all OpenAI-compatible backends (DeepSeek, Qwen, etc.)
     const provider = createOpenAI({
       baseURL: this.config.baseUrl,
-      apiKey: this.config.apiKey,
+      apiKey: effectiveApiKey,
       compatibility: "compatible",
     });
 

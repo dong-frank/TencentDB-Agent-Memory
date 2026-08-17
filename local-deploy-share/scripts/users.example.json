@@ -1,0 +1,11 @@
+[
+  {
+    "username": "alice",
+    "apikey": "ck_replace_with_your_own_key_here_xxxxx",
+    "display_name": "Alice"
+  },
+  {
+    "username": "bob",
+    "apikey": "ck_another_key_xxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+]

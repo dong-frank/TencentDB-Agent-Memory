@@ -364,6 +364,23 @@ export class TdaiGateway {
       hostAdapter: adapter,
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
+      // 抽取链路（L1/L2/L3/skill）携带真实 userId 时，用该用户自己在页面配置的
+      // llm.api_key 覆盖系统级 key（baseUrl/model 仍走系统配置，provider=openai
+      // 直连上游，不经 proxy）。读不到/空值回落系统 key，绝不阻断抽取。
+      // metadata service 是懒加载的，这里惰性获取，与 start() 时序解耦。
+      resolveUserApiKey: async (userId) => {
+        if (!userId) return undefined;
+        try {
+          const svc = await gatewayRef.ensureMetadataService(skillAssetInstanceId);
+          return svc.configParams.getEffectiveParam("llm", "api_key", userId);
+        } catch (err) {
+          gatewayRef.logger.debug?.(
+            `[resolveUserApiKey] getEffectiveParam(llm,api_key,${userId}) failed, `
+              + `falling back to system key: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return undefined;
+        }
+      },
       skillAssetHooks: {
         // v1 首创前置 await：抛异常 = create 失败（避免「skill 已落库但 asset
         // 缺失」的静默不一致）。standalone 模式下唯一的登记入口除了 handler 层的
@@ -1992,12 +2009,27 @@ export class TdaiGateway {
     );
 
     const llmRunner = new StandaloneLLMRunner({
-      config: Object.fromEntries([
-        ["baseUrl", effective.baseUrl],
-        ["apiKey", effective.apiKey],
-        ["model", effective.model ?? "default"],
-        ["timeoutMs", effective.timeoutMs ?? 120_000],
-      ]) as import("../adapters/standalone/llm-runner.js").StandaloneLLMConfig,
+      config: {
+        baseUrl: effective.baseUrl,
+        apiKey: effective.apiKey,
+        model: effective.model ?? "default",
+        timeoutMs: effective.timeoutMs ?? 120_000,
+        // 抽取链路携带真实 userId 时，用该用户自己在页面配置的 llm.api_key 覆盖系统 key
+        //（baseUrl/model 仍走系统配置）。读不到/空值回落系统 key，绝不阻断抽取。
+        resolveUserApiKey: async (userId?: string) => {
+          if (!userId) return undefined;
+          try {
+            const svc = await this.ensureMetadataService(instanceId);
+            return svc.configParams.getEffectiveParam("llm", "api_key", userId);
+          } catch (err) {
+            this.logger.debug?.(
+              `[skill-extractor resolveUserApiKey] getEffectiveParam(llm,api_key,${userId}) failed, `
+                + `falling back to system key: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            return undefined;
+          }
+        },
+      },
     });
     const cfg = this.core.getResolvedSkillConfig();
     return new SkillExtractorClass({

@@ -574,7 +574,15 @@ export async function handleChatCompletions(
   // 内部/外部用户一视同仁 —— internal callers must also request by
   // `modelName`, ensuring upstream ids and billing/observability keys align
   // across all traffic.
-  const requestedModel = typeof body.model === "string" ? body.model : "unknown";
+  let requestedModel = typeof body.model === "string" ? body.model : "unknown";
+  // CodeBuddy SessionStart hook 用 `proxy-<官方模型ID>` 作为自定义模型 id（避免
+  // 覆盖 CodeBuddy 内置官方模型）。但上游 copilot 网关只认官方真实 model_id，
+  // 不认 `proxy-` 前缀，故在此剥离前缀、露出官方 id，再走 gate / alias / 透传，
+  // 既保留"不覆盖官方模型"的意图，又让上游能正确识别。
+  if (requestedModel.startsWith("proxy-")) {
+    requestedModel = requestedModel.slice("proxy-".length);
+    if (typeof body.model === "string") body.model = requestedModel;
+  }
   if (!isModelInPricing(config.creditPricing, requestedModel)) {
     return c.json(
       {
